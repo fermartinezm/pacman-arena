@@ -22,5 +22,5 @@ jobs:
             $p = $g.Split(":")
             if ($p[2] -eq "blue") { $r = "agents/External/heuristic_cp312/heuristic_team.py"; $b = "my_team.py" } else { $r = "my_team.py"; $b = "agents/External/heuristic_cp312/heuristic_team.py" }
             Write-Output "################ $g"
-            python tools/trace.py $r $b $p[0] $p[1] 25 2>&1 
+            python tools/trace.py $r $b $p[0] $p[1] 25 2>&1 | Select-String -NotMatch "track enemy"
           }
