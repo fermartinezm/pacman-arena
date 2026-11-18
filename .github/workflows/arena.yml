@@ -1,26 +1,40 @@
 name: arena
 on:
-  push:
   workflow_dispatch:
+    inputs:
+      teams:
+        description: 'space separated team files to test'
+        default: 'my_team.py'
+      layouts:
+        default: 'defaultCapture RANDOM officeCapture jumboCapture'
+      seeds:
+        default: '6'
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      teams: ${{ steps.m.outputs.teams }}
+      layouts: ${{ steps.m.outputs.layouts }}
+    steps:
+      - id: m
+        run: |
+          echo "teams=$(echo '${{ inputs.teams }}' | jq -Rc 'split(" ")')" >> $GITHUB_OUTPUT
+          echo "layouts=$(echo '${{ inputs.layouts }}' | jq -Rc 'split(" ")')" >> $GITHUB_OUTPUT
   play:
+    needs: setup
     runs-on: windows-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        layout: [defaultCapture, RANDOM, officeCapture, jumboCapture]
+        team: ${{ fromJson(needs.setup.outputs.teams) }}
+        layout: ${{ fromJson(needs.setup.outputs.layouts) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - run: python -m pip install frozendict
-      - name: apex vs heuristic
+      - name: match
         shell: pwsh
-        run: python scripts/evaluate.py -r agents/External/heuristic_cp312/heuristic_team.py -b my_team.py -l ${{ matrix.layout }} -n 6 --swap -j 4 2>&1 | Tee-Object -FilePath results-${{ matrix.layout }}.txt
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: results-${{ matrix.layout }}
-          path: results-${{ matrix.layout }}.txt
+        run: python scripts/evaluate.py -r agents/External/heuristic_cp312/heuristic_team.py -b ${{ matrix.team }} -l ${{ matrix.layout }} -n ${{ inputs.seeds }} --swap -j 4 2>&1
