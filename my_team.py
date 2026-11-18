@@ -65,6 +65,14 @@
 #     1-9 (108 games), 61% -> 66% on fresh seeds 10-27 (216 games).
 #     Tested and dropped: faster siege (15 moves), siege on ties, a capsule
 #     guard (stand on our capsule when an invader nears it): no gain.
+#   - OPEN SIDE / RACE (big maps): when both enemies are on our side as
+#     Pacmen, nobody guards their food. On maps with more than 40 food left
+#     on their side, our attacker no longer makes short 4-food trips (it
+#     keeps eating, up to 60, until a ghost shows up) and the defender
+#     joins the raid instead of chasing (a lone ghost rarely catches a
+#     Pacman in a big open maze). Against a strong all-in attacking team on
+#     jumboCapture: 0-0-32 (avg -86) -> 9-0-23 (avg -24); default, RANDOM
+#     and office unchanged; your league set unchanged (73%).
 #
 # RESULTS (headless, 1200 moves, both colours; see below)
 #   Against 12 teams (your full-view a_star_pro, pddl_astar, alphabeta, a_star,

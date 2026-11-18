@@ -65,6 +65,14 @@
 #     1-9 (108 games), 61% -> 66% on fresh seeds 10-27 (216 games).
 #     Tested and dropped: faster siege (15 moves), siege on ties, a capsule
 #     guard (stand on our capsule when an invader nears it): no gain.
+#   - OPEN SIDE / RACE (big maps): when both enemies are on our side as
+#     Pacmen, nobody guards their food. On maps with more than 40 food left
+#     on their side, our attacker no longer makes short 4-food trips (it
+#     keeps eating, up to 60, until a ghost shows up) and the defender
+#     joins the raid instead of chasing (a lone ghost rarely catches a
+#     Pacman in a big open maze). Against a strong all-in attacking team on
+#     jumboCapture: 0-0-32 (avg -86) -> 9-0-23 (avg -24); default, RANDOM
+#     and office unchanged; your league set unchanged (73%).
 #
 # RESULTS (headless, 1200 moves, both colours; see below)
 #   Against 12 teams (your full-view a_star_pro, pddl_astar, alphabeta, a_star,
@@ -1727,6 +1735,8 @@ class AttackPlanner:
     HUNT_RANGE = 10          # a scared ghost this close (and in time) becomes the goal
     COMMITMENT = 3           # the current target looks this many steps cheaper (avoids dithering)
     HORIZON = 4              # plan up to 4 more food before going home
+    OPEN_QUOTA = 60          # their side unguarded: food per trip
+    OPEN_MIN_FOOD = 40       # ... only on big maps
     REMOTE_MIN = 2           # capsule only when this much food is guarded
     REMOTE_W = 1.0           # remote-first: weight of the food's depth in its side
     MAX_HAZARD = 0.15        # banking risk model: hazard per step right next to a ghost
@@ -1800,7 +1810,12 @@ class AttackPlanner:
         reachable = sum(1 for f in foods if safe_from_me.get(f, INF) < INF)
         if capsules:
             reachable = len(foods)
-        quota = min(quota, carrying + reachable, carrying + self.HORIZON)
+        # OPEN SIDE: when no enemy is home as a ghost, nobody guards their food:
+        # no trip limit, keep eating until a ghost shows up (big maps: long trips).
+        open_side = len(food) > self.OPEN_MIN_FOOD and not any(not e.is_pacman for _, e in enemies)
+        if open_side:
+            quota = max(quota, min(self.OPEN_QUOTA, len(food) - 2))
+        quota = min(quota, carrying + reachable, carrying + (self.OPEN_QUOTA if open_side else self.HORIZON))
         if quota <= carrying and carrying == 0:
             return None, False  # nothing reachable: the caller looks for another way in
 
@@ -2040,6 +2055,7 @@ class PlannerDefender(PlannerAttacker):
     RAID = {'attack':   dict(safe=4, back=3, quota=6),
             'balanced': dict(safe=6, back=4, quota=4)}
 
+    OPEN_RACE = 60
     SIEGE_QUIET = 30     # behind and no invader for this many moves (per agent): both attack
     SIEGE_QUOTA = 4
     quiet_since = {}     # shared by the team: team -> timeleft when an invader was last seen
@@ -2075,6 +2091,8 @@ class PlannerDefender(PlannerAttacker):
         # attack instead (as a Pacman on their side we are not scared).
         if me.scared_timer > self.SCARED_ATTACK:
             return self.attack(game_state, self.RAID['attack']['quota'])
+        if invaders and all(e.is_pacman for _, e in enemies) and len(self.get_food(game_state).as_list()) > 40:
+            return self.attack(game_state, self.OPEN_RACE)   # RACE: both invade on a big map
         if self.siege(game_state, enemies):
             return self.attack(game_state, self.SIEGE_QUOTA)
         threat = min(0 if e.is_pacman else self.distance_home(p) for p, e in enemies)
