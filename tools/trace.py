@@ -16,13 +16,39 @@ st = game.state
 starts = [st.get_initial_agent_position(i) for i in range(4)]
 for a in agents:
     a.register_initial_state(st.deep_copy())
+WIN = os.environ.get('WINDOW')
+calls = []
+if WIN:
+    lo, hi = map(int, WIN.split('-'))
+    def wrap(agent, name):
+        f = getattr(agent, name)
+        def w(*a, **k):
+            r = f(*a, **k)
+            calls.append(f'{name}->{r}' if name not in ('attack','defend') else f'{name}({"lock" if k.get("lock") else ""})->{r}')
+            return r
+        setattr(agent, name, w)
+    for a in agents:
+        if hasattr(a, 'real_obs') or hasattr(a, 'tracker') or hasattr(a, 'defend'):
+            for n in ('defend', 'attack', 'contain', 'pincer', 'keep_distance', 'lure', 'play_decoy_plan', 'flee', 'capsule_guard', 'scared_filter', 'tactical'):
+                if hasattr(a, n):
+                    wrap(a, n)
 eaten = [0]*4; deaths = [0]*4; pac_time = [0]*4; prev = [None]*4
 idx = 0; step = 0
 err_sum = [0, 0]
 print('red =', red, ' blue =', blue, ' agents 0,2 red / 1,3 blue')
 while not st.is_over() and step < 1200:
     obs = agents[idx].observation_function(st.deep_copy())
+    calls.clear()
     act = agents[idx].get_action(obs)
+    if WIN and lo <= step <= hi and hasattr(agents[idx], 'defend'):
+        me = st.data.agent_states[idx]
+        dfi = getattr(agents[idx], 'defender_index', None)
+        try:
+            role = 'DEF' if dfi and dfi(obs) == idx else 'ATT'
+        except Exception:
+            role = '?'
+        ests = [(o, obs.get_agent_position(o), st.get_agent_position(o)) for o in agents[idx].get_opponents(st)]
+        print(f'  t={step} a{idx} {role} at {st.get_agent_position(idx)} mode={agents[idx].team_mode(obs)} -> {act}  calls={calls}  enemies(est,true)={ests}')
     if hasattr(agents[idx], 'real_obs'):
         for o in agents[idx].get_opponents(st):
             est, true = obs.get_agent_position(o), st.get_agent_position(o)
