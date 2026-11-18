@@ -1,0 +1,26 @@
+name: arena
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  play:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        layout: [defaultCapture, RANDOM, officeCapture, jumboCapture]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install frozendict
+      - name: apex vs heuristic
+        shell: pwsh
+        run: python scripts/evaluate.py -r agents/External/heuristic_cp312/heuristic_team.py -b my_team.py -l ${{ matrix.layout }} -n 6 --swap -j 4 2>&1 | Tee-Object -FilePath results-${{ matrix.layout }}.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.layout }}
+          path: results-${{ matrix.layout }}.txt
