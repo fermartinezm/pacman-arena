@@ -5,6 +5,8 @@ on:
       games:
         description: 'space separated layout:seed:apexcolour (e.g. jumboCapture:2:blue)'
         default: 'jumboCapture:2:blue'
+      team:
+        default: 'my_team.py'
       window:
         description: 'step range for per-move decision log, e.g. 140-230'
         default: ''
@@ -23,7 +25,7 @@ jobs:
         run: |
           foreach ($g in "${{ inputs.games }}".Split(" ")) {
             $p = $g.Split(":")
-            if ($p[2] -eq "blue") { $r = "agents/External/heuristic_cp312/heuristic_team.py"; $b = "my_team.py" } else { $r = "my_team.py"; $b = "agents/External/heuristic_cp312/heuristic_team.py" }
+            if ($p[2] -eq "blue") { $r = "agents/External/heuristic_cp312/heuristic_team.py"; $b = "${{ inputs.team }}" } else { $r = "${{ inputs.team }}"; $b = "agents/External/heuristic_cp312/heuristic_team.py" }
             Write-Output "################ $g"
             $env:WINDOW = "${{ inputs.window }}"; python tools/trace.py $r $b $p[0] $p[1] 25 2>&1 | Select-String -NotMatch "track enemy"
           }
