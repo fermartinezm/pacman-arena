@@ -1,0 +1,26 @@
+name: trace
+on:
+  workflow_dispatch:
+    inputs:
+      games:
+        description: 'space separated layout:seed:apexcolour (e.g. jumboCapture:2:blue)'
+        default: 'jumboCapture:2:blue jumboCapture:2:red defaultCapture:3:blue'
+jobs:
+  trace:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install frozendict
+      - name: traces
+        shell: pwsh
+        run: |
+          foreach ($g in "${{ inputs.games }}".Split(" ")) {
+            $p = $g.Split(":")
+            if ($p[2] -eq "blue") { $r = "agents/External/heuristic_cp312/heuristic_team.py"; $b = "my_team.py" } else { $r = "my_team.py"; $b = "agents/External/heuristic_cp312/heuristic_team.py" }
+            Write-Output "################ $g"
+            python tools/trace.py $r $b $p[0] $p[1] 50 2>&1 | Select-String -NotMatch "^\s+File|^Traceback|^\s"
+          }
