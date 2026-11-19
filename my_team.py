@@ -127,6 +127,19 @@
 # 4. DEFEND THE LEAD. Winning: balanced mode (one attacks, one defends and
 #    only raids when nobody threatens us); winning by LOCK_LEAD (4) or near the
 #    end: both defend, each one marking an enemy, so they cannot bring food home.
+# 6. TWO ROLES vs DOUBLE ATTACKERS (RoleAttacker + RoleGuard, small maps).
+#    Once both enemies have been on our side at the same time for ROLES_AFTER
+#    (15) turns, the team stops swapping roles: the attacker always attacks and
+#    eats their capsule alone; the guard stays home, cuts invaders off from
+#    their side, stands between an invader and our capsule (never on it) and,
+#    when we are not ahead, snipes the one food it can bring back before any
+#    ghost can intercept it. If our ghosts are scared or an invader is about to
+#    eat our capsule, both attack. Big maps keep FlexAgent + capsule blitz.
+#    vs the external double-attacker (64 games/map): default 21-43 -> 36-27,
+#    total 143 -> 155 of 256; league (216 games) 70% -> 69% points.
+#    Discarded: fixed top/bottom lanes (jumbo 37 -> 17), roles from move 1
+#    (league 53%), roles on big maps (jumbo 15), lock from +2 (RANDOM -3).
+#
 # 5. NO FIXED ROLES (FlexAgent). Every turn the team decides: an agent on the
 #    enemy side carrying food stays the attacker; otherwise the agent closer to
 #    the threat (nearest invader, or our border) defends and the other attacks.
@@ -532,8 +545,8 @@ def get_tracker(agent, game_state):
 #################
 
 def create_team(first_index, second_index, is_red,
-                first='FlexAgent', second='FlexAgent', num_training=0):
-    agents = {cls.__name__: cls for cls in (PlannerAttacker, PlannerDefender, FlexAgent)}
+                first='RoleAttacker', second='RoleGuard', num_training=0):
+    agents = {cls.__name__: cls for cls in (PlannerAttacker, PlannerDefender, FlexAgent, RoleAttacker, RoleGuard)}
     team = [agents[first](first_index), agents[second](second_index)]
     key = object()   # one shared tracker for this team in this game
     for a in team:
@@ -720,6 +733,115 @@ class PlannerAgentBase(CaptureAgent):
                             if not self.walls[x][y] and not self.on_my_side((x, y))]
         self.home_dist = {c: self.distance_home(c) for c in self.enemy_cells + own}
         self.big_map = len(self.get_food(game_state).as_list()) > self.BIG_MAP_FOOD
+        # LANES: their food is split in a bottom and a top half (same amount each);
+        # the agent that starts higher takes the top lane.
+        ys = sorted(y for _, y in self.get_food(game_state).as_list())
+        self.lane_split = ys[len(ys) // 2] if ys else self.walls.height // 2
+        starts = {i: game_state.get_initial_agent_position(i)[1] for i in self.team}
+        self.lane_top = max(self.team, key=lambda i: (starts[i], i)) == self.index
+
+    LANES = False
+    CAP_GUARD = 8       # an invader this close to our capsule: a defender blocks it
+    CAP_LOST_SCARE = 99  # our ghosts scared at least this long: both attack
+
+    ROLES_AFTER = 15    # turns with both enemies on our side at once: switch to attacker + guard
+    both_in = {}        # shared by the team: team -> [last timeleft, count]
+
+    def roles_on(self, game_state):
+        key, tl = tuple(self.team), game_state.data.timeleft
+        st = self.both_in.get(key)
+        if st is None or st[0] < tl:
+            st = [tl + 1, 0]
+            self.both_in[key] = st
+        if st[0] != tl:
+            st[0] = tl
+            if all(e.is_pacman for e in (game_state.get_agent_state(i) for i in self.get_opponents(game_state))):
+                st[1] += 1
+        return not self.big_map and st[1] >= self.ROLES_AFTER
+
+    def lane_food(self, game_state, food):
+        """Food of my lane while the teammate is also on their side, else all of it."""
+        if not self.LANES:
+            return food
+        mate = [i for i in self.team if i != self.index][0]
+        if not game_state.get_agent_state(mate).is_pacman:
+            return food
+        lane = [f for f in food if (f[1] >= self.lane_split) == self.lane_top]
+        return lane or food
+
+    def capsule_threat(self, game_state):
+        """(invader, capsule) for the invader closest to one of our capsules, within CAP_GUARD, or None."""
+        caps = self.get_capsules_you_are_defending(game_state)
+        if not caps or not self.roles_on(game_state):
+            return None
+        best = None
+        for p, e in self.enemy_states(game_state):
+            if e.is_pacman:
+                for c in caps:
+                    d = self.dist(p, c)
+                    if d <= self.CAP_GUARD and (best is None or d < best[0]):
+                        best = (d, p, c)
+        return best and best[1:]
+
+    def capsule_lost(self, game_state):
+        """Our capsule is eaten (our ghosts scared) or an invader will get it before any of us."""
+        if not self.roles_on(game_state):
+            return False
+        for i in self.team:
+            if game_state.get_agent_state(i).scared_timer >= self.CAP_LOST_SCARE:
+                return True
+        t = self.capsule_threat(game_state)
+        if t is None:
+            return False
+        inv, cap = t
+        d_inv = self.dist(inv, cap)
+        if d_inv > 2:
+            return False
+        for i in self.team:
+            st = game_state.get_agent_state(i)
+            if not st.is_pacman and self.dist(self.cell(st.get_position()), cap) < d_inv:
+                return False
+        return True
+
+    def guard_capsule(self, game_state):
+        """
+        CAPSULE DENIAL. An invader near our capsule: the ghost that gets there first
+        stays between them, always closer to the capsule than the invader (never on
+        it: a Pacman eating it would also eat us), and moves in on the invader.
+        """
+        t = self.capsule_threat(game_state)
+        if t is None:
+            return None
+        inv, cap = t
+        me = game_state.get_agent_state(self.index)
+        if me.is_pacman or me.scared_timer > 0:
+            return None
+        my_pos = self.cell(me.get_position())
+        mates = [self.cell(game_state.get_agent_state(i).get_position()) for i in self.team
+                 if i != self.index and not game_state.get_agent_state(i).is_pacman
+                 and game_state.get_agent_state(i).scared_timer == 0]
+        mine = self.dist(my_pos, cap)
+        if any(self.dist(m, cap) < mine or (self.dist(m, cap) == mine and i < self.index)
+               for i, m in zip([i for i in self.team if i != self.index], mates)):
+            return None      # the teammate guards it
+        d_inv = self.dist(inv, cap)
+        best, best_v = None, None
+        for a in game_state.get_legal_actions(self.index):
+            dx, dy = Actions.direction_to_vector(a)
+            c = (int(my_pos[0] + dx), int(my_pos[1] + dy))
+            if not self.on_my_side(c):
+                continue
+            if c == inv:
+                return a
+            if c == cap or self.dist(c, cap) >= d_inv:
+                continue
+            v = self.dist(c, inv)
+            if best_v is None or v < best_v:
+                best, best_v = a, v
+        if best is None:
+            return None
+        self.cap_guards = getattr(self, 'cap_guards', 0) + 1
+        return best
 
     # --- team roles -------------------------------------------------------
 
@@ -832,6 +954,9 @@ class PlannerAgentBase(CaptureAgent):
             return self.flee(game_state, active)
 
         invaders = [p for p, e in enemies if e.is_pacman]
+        action = self.guard_capsule(game_state)
+        if action is not None:
+            return action
         if lock and me.scared_timer == 0:
             action = self.lure(game_state, my_pos, enemies)
             if action is not None:
@@ -1958,6 +2083,7 @@ class AttackPlanner:
             capsules = []      # BLITZ: the capsule waits until both of us are on their side
         # REMOTE FIRST: the deepest food (far from their border, the hardest to reach
         # later) is preferred; the easy food near the border is left for later.
+        food_pool = a.lane_food(game_state, food_pool)
         foods = sorted(food_pool, key=lambda f: (safe_from_me.get(f, INF) - self.REMOTE_W * a.distance_home(f),
                                                  a.dist(my_pos, f)))[:self.MAX_FOOD_TARGETS]
         prey = []  # NO HUNTING: eating a ghost gives no points
@@ -2342,6 +2468,12 @@ class FlexAgent(PlannerDefender):
         return defender
 
     def choose_action(self, game_state):
+        if self.capsule_lost(game_state):
+            self.cap_lost_moves = getattr(self, 'cap_lost_moves', 0) + 1
+            return self.attack(game_state, self.RAID['attack']['quota'])
+        action = self.guard_capsule(game_state)
+        if action is not None:
+            return action
         phase = getattr(self, 'phase', None)
         if phase == 'setup' and self.team_mode(game_state) in ('attack', 'balanced'):
             enemies = self.enemy_states(game_state)
@@ -2351,3 +2483,93 @@ class FlexAgent(PlannerDefender):
         if self.defender_index(game_state) == self.index:
             return PlannerDefender.choose_action(self, game_state)
         return PlannerAttacker.choose_action(self, game_state)
+
+
+class RoleAttacker(FlexAgent):
+    """
+    ROLE 1, THE ATTACKER. Always on their side: plans the most food per trip
+    with the A* planner, eats their capsule when food is guarded and then
+    clears the deepest food while their ghosts are scared (blitz). It only
+    stops attacking to defend a clear lead (lock) with nothing to bank.
+    """
+    def blitz(self, game_state):
+        phase = super().blitz(game_state)
+        if not self.roles_on(game_state):
+            return phase       # big maps: both attack together (FlexAgent + capsule blitz)
+        return None if phase == 'setup' else phase   # no waiting for the guard
+
+    def choose_action(self, game_state):
+        if not self.roles_on(game_state):
+            return FlexAgent.choose_action(self, game_state)
+        me = game_state.get_agent_state(self.index)
+        if self.team_mode(game_state) == 'lock' and not (me.is_pacman and me.num_carrying > 0):
+            return self.defend(game_state, lock=True)
+        return self.attack(game_state, self.QUOTA)
+
+
+class RoleGuard(FlexAgent):
+    """
+    ROLE 2, THE GUARD. Lives on our side. Invaders may come in, but:
+      - none goes back home with food (chase, contain: cut it off from its side,
+        trap it together with the attacker when that one is home);
+      - none eats our capsule (the guard stays between the invader and it).
+    When we are not ahead and the coast is clear, it snipes the single safest
+    food on their side (one it can reach and bring back before any ghost can
+    get there, by the timed reachability of the A* safety code) and returns.
+    """
+    SNIPE_MAX = 14      # longest round trip (moves) for a snipe
+    SNIPE_LEAD = 0      # snipe only while our lead is at most this
+
+    def blitz(self, game_state):
+        phase = super().blitz(game_state)
+        if not self.roles_on(game_state):
+            return phase       # big maps: both attack together (FlexAgent + capsule blitz)
+        return None if phase == 'setup' else phase
+
+    def snipe_target(self, game_state, my_pos):
+        eta = self.ghost_eta(game_state)
+        food = self.get_food(game_state).as_list()
+        if not eta:
+            times = self.bfs_distances(my_pos)
+            cands = [(times.get(f, INF) + self.home_dist.get(f, INF), f) for f in food]
+        else:
+            times = self.timed_reach(my_pos, eta)
+            cands = [(times[f] + self.home_dist[f], f) for f in food
+                     if f in times and self.can_escape(f, times[f], eta)]
+        cands = [c for c in cands if c[0] <= self.SNIPE_MAX]
+        return min(cands)[1] if cands else None
+
+    def choose_action(self, game_state):
+        if not self.roles_on(game_state):
+            return FlexAgent.choose_action(self, game_state)
+        me = game_state.get_agent_state(self.index)
+        my_pos = self.cell(me.get_position())
+        enemies = self.enemy_states(game_state)
+        if not enemies:
+            return Directions.STOP
+        active = [p for p, e in enemies if not e.is_pacman and e.scared_timer <= 2]
+        danger = self.danger_zone(active, my_pos)
+        invaders = [p for p, e in enemies if e.is_pacman]
+        if me.is_pacman:
+            target = getattr(self, 'snipe', None)
+            food = set(self.get_food(game_state).as_list())
+            if me.num_carrying == 0 and not invaders and target in food:
+                action, _ = self.bfs(my_pos, [target], danger)
+                if self.legal(game_state, action) and action != Directions.STOP:
+                    return action
+            self.snipe = None
+            action, _ = self.bfs(my_pos, self.home_border, danger)
+            if self.legal(game_state, action) and action != Directions.STOP:
+                return action
+            return self.flee(game_state, active)
+        if me.scared_timer > self.SCARED_ATTACK and not invaders:
+            return self.attack(game_state, 1)
+        if not invaders and self.get_score(game_state) <= self.SNIPE_LEAD:
+            target = self.snipe_target(game_state, my_pos)
+            if target is not None:
+                self.snipe = target
+                self.snipes = getattr(self, 'snipes', 0) + 1
+                action, _ = self.bfs(my_pos, [target], danger)
+                if self.legal(game_state, action) and action != Directions.STOP:
+                    return action
+        return self.defend(game_state)
