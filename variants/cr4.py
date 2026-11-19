@@ -2669,7 +2669,7 @@ class CapsuleKeeper(RoleGuard):
             post = self.park_cell(cap)
         if my_pos == post:
             return Directions.STOP
-        action, _ = self.bfs(my_pos, [post], blocked=frozenset([cap]), allowed=self.on_my_side)
+        action, _ = self.bfs(my_pos, [post], allowed=self.on_my_side)   # walking over our capsule is safe
         if self.legal(game_state, action):
             self.guarding = True
             return action
