@@ -48,7 +48,7 @@ while not st.is_over() and step < 1200:
         except Exception:
             role = '?'
         ests = [(o, obs.get_agent_position(o), st.get_agent_position(o)) for o in agents[idx].get_opponents(st)]
-        print(f'  t={step} a{idx} {role} at {st.get_agent_position(idx)} mode={agents[idx].team_mode(obs)} -> {act}  calls={calls}  enemies(est,true)={ests}')
+        print(f'  t={step} a{idx} {role} tgt={getattr(agents[idx],"plan_target",None)} at {st.get_agent_position(idx)} mode={agents[idx].team_mode(obs)} -> {act}  calls={calls}  enemies(est,true)={ests}')
     if hasattr(agents[idx], 'real_obs'):
         for o in agents[idx].get_opponents(st):
             est, true = obs.get_agent_position(o), st.get_agent_position(o)
