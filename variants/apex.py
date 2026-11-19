@@ -73,6 +73,13 @@
 #     Pacman in a big open maze). Against a strong all-in attacking team on
 #     jumboCapture: 0-0-32 (avg -86) -> 9-0-23 (avg -24); default, RANDOM
 #     and office unchanged; your league set unchanged (73%).
+#   - TRAP (two ghosts together): when both our agents are ghosts at home
+#     within TRAP_RANGE (10) of an invader carrying food, they choose their
+#     moves jointly (every pair of moves scored by the region the invader
+#     still controls, huge if it can still reach its side) and each plays
+#     its half, closing the exits from both ends. Against a strong all-in
+#     team (128 games): 59 -> 64 wins (default 8 -> 12, office 27 -> 29);
+#     your league set (216 games): 69% -> 70%.
 #
 # RESULTS (headless, 1200 moves, both colours; see below)
 #   Against 12 teams (your full-view a_star_pro, pddl_astar, alphabeta, a_star,
@@ -816,6 +823,12 @@ class PlannerAgentBase(CaptureAgent):
             if action is not None:
                 self.guarding = True  # the lure is a team plan: no tactical override
                 return action
+        if me.scared_timer == 0:
+            inv_t = self.trap_target(game_state)
+            if inv_t is not None:
+                action = self.trap(game_state, inv_t)
+                if action is not None and self.legal(game_state, action):
+                    return action
         mark_pos, mark = self.marked_enemy(game_state, enemies, lock)
         mate = self.mate_chaser(game_state)
         if mark.is_pacman:
@@ -896,6 +909,63 @@ class PlannerAgentBase(CaptureAgent):
             v = self.invader_region(inv, [pos] + others) * 10 + self.dist(pos, inv)
             if best_v is None or v < best_v:
                 best, best_v = action, v
+        return best
+
+    # --- TRAP: two ghosts corner an invader together -------------------------
+    TRAP_RANGE = 10    # both our ghosts within this many cells of the invader
+    TRAP_CARRY = 1     # ... carrying at least this much food
+
+    def trap_target(self, game_state):
+        """The invader both our ghosts should corner now, or None."""
+        enemies = self.enemy_states(game_state)
+        invaders = [(p, e) for p, e in enemies if e.is_pacman and e.num_carrying >= self.TRAP_CARRY]
+        if not invaders:
+            return None
+        ours = []
+        for i in self.team:
+            st = game_state.get_agent_state(i)
+            if st.is_pacman or st.scared_timer > 0 or st.num_carrying > 0:
+                return None
+            ours.append(self.cell(st.get_position()))
+        best = None
+        for p, e in invaders:
+            if all(self.dist(o, p) <= self.TRAP_RANGE for o in ours):
+                key = (e.num_carrying, -sum(self.dist(o, p) for o in ours))
+                if best is None or key > best[0]:
+                    best = (key, p)
+        return best and best[1]
+
+    def trap(self, game_state, inv):
+        """
+        TRAP. A lone ghost chasing a good Pacman in a maze with loops never
+        catches it. Here both ghosts choose their next cells TOGETHER: every
+        pair of moves is scored by the region the invader still controls (the
+        cells it reaches strictly before both ghosts, with a huge cost if that
+        region still touches its own side, plus our food and capsule in it),
+        then by how close the ghosts get. Both agents run the same search and
+        each plays its own half, so they close the exits from both ends.
+        """
+        self.cur_state = game_state
+        mate = [i for i in self.team if i != self.index][0]
+        my_pos = self.cell(game_state.get_agent_state(self.index).get_position())
+        mate_pos = self.cell(game_state.get_agent_state(mate).get_position())
+        mine = []
+        for a in game_state.get_legal_actions(self.index):
+            dx, dy = Actions.direction_to_vector(a)
+            c = (int(my_pos[0] + dx), int(my_pos[1] + dy))
+            if self.on_my_side(c):
+                if c == inv:
+                    return a
+                mine.append((a, c))
+        theirs = [mate_pos] + [n for n in self.neighbours(mate_pos) if self.on_my_side(n)]
+        best, best_v = None, None
+        for a, c in mine:
+            for m in theirs:
+                v = self.invader_region(inv, [c, m]) * 10 + self.dist(c, inv) + self.dist(m, inv)
+                if best_v is None or v < best_v or (v == best_v and a != Directions.STOP and best == Directions.STOP):
+                    best, best_v = a, v
+        if best is not None:
+            self.traps = getattr(self, 'traps', 0) + 1
         return best
 
     def mate_chaser(self, game_state):
@@ -2011,6 +2081,12 @@ class PlannerAttacker(PlannerAgentBase):
         # carries nothing does not trigger this, so it cannot drag us around.
         # COUNTER-RAID: when every enemy is on our side, nobody guards their food:
         # attacking is worth more than a third chaser.
+        if not me.is_pacman and me.scared_timer == 0 and me.num_carrying == 0:
+            inv_t = self.trap_target(game_state)
+            if inv_t is not None:
+                action = self.trap(game_state, inv_t)
+                if action is not None and self.legal(game_state, action):
+                    return action
         unguarded = all(e.is_pacman for p, e in enemies)
         if not me.is_pacman and me.scared_timer == 0 and not unguarded:
             loaded = [p for p, e in enemies if e.is_pacman and e.num_carrying >= self.HELP_CARRY]
