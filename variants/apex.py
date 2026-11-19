@@ -80,6 +80,15 @@
 #     its half, closing the exits from both ends. Against a strong all-in
 #     team (128 games): 59 -> 64 wins (default 8 -> 12, office 27 -> 29);
 #     your league set (216 games): 69% -> 70%.
+#   - CAPSULE BLITZ (big maps, > 40 food per side): both agents set up on
+#     their side, the closer one eats the capsule once both are there, both
+#     collect food (deepest first, each its own targets, only what they can
+#     still bring home before the scare ends), run home, then defend while
+#     leading. Also fixes power_step (inherited empty from a_star_pro, so the
+#     power play after a capsule never ran). Against a strong all-in team on
+#     jumboCapture: 19-1-44 -> 37-1-26 (avg -24.6 -> -4.4, 64 games); small
+#     maps unchanged (the plan leaves our side open too long there); league
+#     set unchanged (70%).
 #
 # RESULTS (headless, 1200 moves, both colours; see below)
 #   Against 12 teams (your full-view a_star_pro, pddl_astar, alphabeta, a_star,
@@ -636,7 +645,9 @@ def plan_astar(init, goal, actions, heuristic=lambda s: 0, max_expansions=20000,
 
 class PlannerAgentBase(CaptureAgent):
     DEAD_END_SAFETY = False
+    BIG_MAP_FOOD = 40  # more food than this on their side at the start: a big map
     LOCK_LEAD = 6      # winning by this much: both agents defend
+    POST_LOCK = True   # after the capsule blitz, with any lead: both defend
     LOCK_MOVES = 60    # winning with this few moves left (per agent): both defend
     GUARD_DEPTH = 1    # defenders wait one step behind the border (no face-off)
     BREAK_TURNS = 4    # loop brain: turns spent avoiding the cells of a detected loop
@@ -708,6 +719,7 @@ class PlannerAgentBase(CaptureAgent):
         self.enemy_cells = [(x, y) for x in range(self.walls.width) for y in range(self.walls.height)
                             if not self.walls[x][y] and not self.on_my_side((x, y))]
         self.home_dist = {c: self.distance_home(c) for c in self.enemy_cells + own}
+        self.big_map = len(self.get_food(game_state).as_list()) > self.BIG_MAP_FOOD
 
     # --- team roles -------------------------------------------------------
 
@@ -720,6 +732,8 @@ class PlannerAgentBase(CaptureAgent):
             return 'decoy'   # SIEGE: they stopped attacking to defend their lead
         if lead <= 0:
             return 'attack'
+        if self.POST_LOCK and getattr(self, 'phase', None) == 'post':
+            return 'lock'      # after the blitz, with the lead: both defend
         if lead >= self.LOCK_LEAD or game_state.data.timeleft // 4 <= self.LOCK_MOVES:
             return 'lock'
         return 'balanced'
@@ -1111,11 +1125,24 @@ class PlannerAgentBase(CaptureAgent):
     POWER_MARGIN = 2    # moves of margin to be home before the scare ends
 
     def get_action(self, game_state):
-        action = self._base_get_action(game_state)
         try:
-            action = self.power_filter(game_state, action)
+            phase = self.blitz(game_state)
         except Exception:
             traceback.print_exc()
+            phase = None
+        self.phase = phase
+        action = None
+        if phase == 'blitz':
+            try:
+                action = self.blitz_action(game_state)
+            except Exception:
+                traceback.print_exc()
+        if action is None:
+            action = self._base_get_action(game_state)
+            try:
+                action = self.power_filter(game_state, action)
+            except Exception:
+                traceback.print_exc()
         try:
             action = self.scared_filter(game_state, action)
         except Exception:
@@ -1174,8 +1201,8 @@ class PlannerAgentBase(CaptureAgent):
           - when the scare left only covers the way home, it goes home to bank.
         """
         me = game_state.get_agent_state(self.index)
-        if not me.is_pacman:
-            return action
+        if not me.is_pacman or not self.big_map:
+            return action          # small maps: measured better without the power play
         ghosts = [(p, e) for p, e in self.enemy_states(game_state) if not e.is_pacman]
         if not ghosts or any(e.scared_timer <= 0 for _, e in ghosts):
             return action                                   # not every ghost is scared
@@ -1209,10 +1236,90 @@ class PlannerAgentBase(CaptureAgent):
         target = min(feasible, key=lambda f: self.dist(my_pos, f) - 0.5 * self.distance_home(f))
         return self.power_step(game_state, my_pos, {target}, avoid) or action
 
+    # --- CAPSULE BLITZ (team plan) ------------------------------------------------
+    # 1. SETUP: both agents go to the enemy side; the capsule is eaten only once
+    #    both are there (by the one closer to it).
+    # 2. BLITZ: while their ghosts are scared, both agents collect food, the
+    #    hardest first (deepest in their side), each its own targets, only food
+    #    they can still bring home before the scare ends.
+    # 3. HOME: when the scare is about to end, both run home (only the ghost's
+    #    own cell is avoided: it may follow one cell behind).
+    # 4. DEFEND: after the blitz, with the lead, both agents defend.
+    BLITZ_MARGIN = 2        # moves of margin to be home when the scare ends
+    BLITZ_FROM = 0          # first move (whole game) at which the setup may start
+    BLITZ_MIN_FOOD = 40     # (see BIG_MAP_FOOD)
+    BLITZ_MIN_FOOD = 40     # only on big maps: on small ones the setup leaves our side open too long
+    BLITZ_ABORT = 4         # an invader carrying this much cancels the setup for our defender
+    blitz_state = {}        # shared by the team: team -> dict(tl, phase, caps, targets)
+
+    def blitz(self, game_state):
+        """Current phase of the team plan: 'setup', 'blitz', 'post' or None."""
+        if not self.big_map:
+            return None        # small maps: the plan leaves our side open too long (measured)
+        key, tl = tuple(self.team), game_state.data.timeleft
+        st = self.blitz_state.get(key)
+        if st is None or st['tl'] < tl:
+            st = dict(tl=tl, phase=None, caps=len(self.get_capsules(game_state)), targets={})
+            self.blitz_state[key] = st
+        if st['tl'] == tl and st.get('done_tl') == tl:
+            return st['phase']
+        st['tl'], st['done_tl'] = tl, tl
+        caps = len(self.get_capsules(game_state))
+        enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
+        scare = max([e.scared_timer for e in enemies] or [0])
+        if caps < st['caps'] and scare > 0:
+            st['phase'] = 'blitz'                   # we just ate their capsule
+        elif st['phase'] == 'blitz' and scare == 0:
+            st['phase'] = 'post'
+            st['targets'] = {}
+        elif st['phase'] in (None, 'setup'):
+            st['phase'] = 'setup' if caps > 0 and 1200 - tl >= self.BLITZ_FROM and \
+                self.big_map and len(self.get_food(game_state).as_list()) > self.BLITZ_MIN_FOOD else None
+        st['caps'] = caps
+        return st['phase']
+
+    def blitz_action(self, game_state):
+        """BLITZ phase move for either agent (also a ghost still at home)."""
+        me = game_state.get_agent_state(self.index)
+        my_pos = self.cell(me.get_position())
+        enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
+        ghosts = [(self.cell(e.get_position()), e.scared_timer) for e in enemies
+                  if not e.is_pacman and e.get_position() is not None]
+        if not ghosts:
+            return None
+        scare = min(t for _, t in ghosts)
+        if scare <= 0:
+            return None
+        avoid = {p for p, _ in ghosts}                  # never eat a scared ghost (it respawns unscared)
+        home = self.distance_home(my_pos) if not self.on_my_side(my_pos) else 0
+        st = self.blitz_state[tuple(self.team)]
+        if scare <= home + self.BLITZ_MARGIN:
+            st['targets'].pop(self.index, None)
+            if me.is_pacman:
+                return self.power_step(game_state, my_pos, set(self.home_border), avoid)
+            return None
+        food = self.get_food(game_state).as_list()
+        mate_t = [t for i, t in st['targets'].items() if i != self.index]
+        feasible = [f for f in food if f not in mate_t
+                    and self.dist(my_pos, f) + self.distance_home(f) + self.BLITZ_MARGIN <= scare]
+        if not feasible:
+            st['targets'].pop(self.index, None)
+            if me.is_pacman and me.num_carrying > 0:
+                return self.power_step(game_state, my_pos, set(self.home_border), avoid)
+            return None
+        # hardest first: the deepest food, but not a long detour for it
+        target = max(feasible, key=lambda f: (self.distance_home(f) - 0.5 * self.dist(my_pos, f)))
+        st['targets'][self.index] = target
+        return self.power_step(game_state, my_pos, {target}, avoid)
+
     def power_step(self, game_state, start, targets, blocked):
         """Legal first move of a shortest path from start to any target avoiding `blocked`, or None."""
         if not targets:
             return None
+        action, _ = self.bfs(start, targets, frozenset(blocked) - set(targets))
+        if action is None or action == Directions.STOP or not self.legal(game_state, action):
+            return None
+        return action
 
 
     # --- TIME-AWARE A* (escape safety) ------------------------------------------
@@ -1846,6 +1953,9 @@ class AttackPlanner:
         remote = [f for f in food if safe_from_me.get(f, INF) == INF]
         if len(remote) < self.REMOTE_MIN:
             capsules = []
+        if getattr(a, 'phase', None) == 'setup' and not all(
+                game_state.get_agent_state(i).is_pacman for i in a.team):
+            capsules = []      # BLITZ: the capsule waits until both of us are on their side
         # REMOTE FIRST: the deepest food (far from their border, the hardest to reach
         # later) is preferred; the easy food near the border is left for later.
         foods = sorted(food_pool, key=lambda f: (safe_from_me.get(f, INF) - self.REMOTE_W * a.distance_home(f),
@@ -2099,6 +2209,18 @@ class PlannerAttacker(PlannerAgentBase):
                     self.helps = getattr(self, 'helps', 0) + 1
                     return action
 
+        if getattr(self, 'phase', None) == 'setup':
+            caps = self.get_capsules(game_state)
+            mate = [i for i in self.team if i != self.index][0]
+            mst = game_state.get_agent_state(mate)
+            mpos = self.cell(mst.get_position())
+            if caps and me.is_pacman and mst.is_pacman:
+                mine = min(self.dist(my_pos, c) for c in caps)
+                theirs = min(self.dist(mpos, c) for c in caps)
+                if mine < theirs or (mine == theirs and self.index < mate):
+                    action, _ = self.bfs(my_pos, caps, danger)
+                    if self.legal(game_state, action) and action != Directions.STOP:
+                        return action
         target, powered = self.planner.solve(game_state, quota)
         self.plan_target = target  # what the strategic plan is heading to (cell or 'home')
         blocked = frozenset() if powered else danger
@@ -2220,6 +2342,12 @@ class FlexAgent(PlannerDefender):
         return defender
 
     def choose_action(self, game_state):
+        phase = getattr(self, 'phase', None)
+        if phase == 'setup' and self.team_mode(game_state) in ('attack', 'balanced'):
+            enemies = self.enemy_states(game_state)
+            loaded = any(e.is_pacman and e.num_carrying >= self.BLITZ_ABORT for _, e in enemies)
+            if not loaded:
+                return self.attack(game_state, self.RAID['attack']['quota'])
         if self.defender_index(game_state) == self.index:
             return PlannerDefender.choose_action(self, game_state)
         return PlannerAttacker.choose_action(self, game_state)
