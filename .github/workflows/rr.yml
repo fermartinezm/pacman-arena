@@ -1,0 +1,44 @@
+name: roundrobin
+on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: 'space separated "red_path,blue_path" pairs'
+        default: ''
+      layouts:
+        default: 'defaultCapture RANDOM'
+      seeds:
+        default: '1-8'
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      pairs: ${{ steps.m.outputs.pairs }}
+      layouts: ${{ steps.m.outputs.layouts }}
+    steps:
+      - id: m
+        run: |
+          echo "pairs=$(echo '${{ inputs.pairs }}' | jq -Rc 'split(" ")')" >> $GITHUB_OUTPUT
+          echo "layouts=$(echo '${{ inputs.layouts }}' | jq -Rc 'split(" ")')" >> $GITHUB_OUTPUT
+  play:
+    needs: setup
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 40
+      matrix:
+        pair: ${{ fromJson(needs.setup.outputs.pairs) }}
+        layout: ${{ fromJson(needs.setup.outputs.layouts) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install frozendict
+      - name: match
+        shell: pwsh
+        run: |
+          $p = "${{ matrix.pair }}".Split(",")
+          Write-Output "PAIR $($p[0]) VS $($p[1]) ON ${{ matrix.layout }}"
+          python scripts/evaluate.py -r $p[0] -b $p[1] -l ${{ matrix.layout }} -n ${{ inputs.seeds }} --swap -j 4 2>&1
