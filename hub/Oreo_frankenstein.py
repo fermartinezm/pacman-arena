@@ -570,6 +570,27 @@ def get_tracker(agent, game_state):
 #                            FIRST= 70: friend default 45-19, league 62%
 #                            FIRST= 80: friend default 39-24, league 65%
 #                            (apex:       friend default 36-27, league 69%)
+# FAILURE FIXES (each one an "if" for a situation where we lost, found by
+# replaying the games frankenstein lost and apex did not):
+#   FIX 1  a lone invader already carrying >= KEEP_CHASE_CARRY (2) food is not a
+#          capsule runner: the keeper leaves its ring and defends normally.
+#   FIX 2  attacker with no safe plan for NOPLAN_RISK (12) turns in a row (stuck
+#          circling at their border): take the risk mode and go in.
+#   FIX 3  guard/keeper, behind and no invader for QUIET_JOIN (20) turns: join
+#          the attack.
+#   FIX 4  siege decoy that the defenders ignore (no food eaten for DECOY_STALL
+#          (25) turns): the decoy attacks too for DECOY_PUSH (40) turns.
+#   FIX 5  our capsule eaten and both enemies looting our side: the scared guard
+#          loots their empty side instead of watching.
+#   Measured (league = 108 games per map vs a_star_pro, pddl_astar, alphabeta;
+#   friend = 64 games per map):
+#                 league default  league RANDOM  friend default  friend RANDOM
+#     before          45%             -              51-10          25-38
+#     FIX 1-2         54%             -              46-15          25-38
+#     FIX 1-4         57%            69%             46-17          25-38
+#     FIX 1-5         56%            71%             48-14          25-38
+#   Tried and dropped: keeper on maps with two capsules per side (friend RANDOM
+#   21-41, league RANDOM 52%).
 # The plan can also be picked without editing the file with the environment
 # variable OREO_PLAN, or with create_team(..., plan='capsule_race').
 # Built from: alphabeta.py (tactical alpha-beta), pddl_astar.py (A* PDDL
@@ -720,13 +741,17 @@ class PlannerAgentBase(CaptureAgent):
     DECOY_MOVES = 30   # decoy plan in the last moves of the game (per agent) when not winning
     DECOY_DISTANCE = 3 # the decoy hovers this far from the defender it distracts
     DECOY_GUARD = 8    # the decoy goes after invaders this close to it
+    DECOY_STALL = 25   # FIX 4: decoy turns without progress before it attacks too
+    DECOY_PUSH = 40    # ... for this many turns, then decoy again
     decoy_roles = {}   # shared by the two agents of the team: team -> (timeleft, decoy index)
     # Anti-loop: stuck = last LOOP_WINDOW attacking turns on <= LOOP_CELLS cells without eating.
     LOOP_WINDOW = 10
     LOOP_CELLS = 4
     RISK_TURNS = 6      # turns of risk mode (may pass next to a ghost)
     DETOUR_TURNS = 10   # turns of detour (retreat and enter somewhere else)
-    RISK_MAX_CARRY = 2  # take risks only while carrying at most this much food
+    RISK_MAX_CARRY = 2
+    NOPLAN_RISK = 12    # FIX 2: turns without a safe plan before taking the risk mode
+    # take risks only while carrying at most this much food
 
     team_key = None
 
@@ -943,6 +968,18 @@ class PlannerAgentBase(CaptureAgent):
         my_pos = self.cell(me.get_position())
         enemies = self.enemy_states(game_state)
         active = [p for p, e in enemies if not e.is_pacman and e.scared_timer <= 2]
+        # FIX 4: the defenders do not take the bait (siege stalemate: no food
+        # eaten by our team for DECOY_STALL turns): the decoy attacks too, so
+        # the two marked defenders face two attackers at once.
+        progress = (self.get_score(game_state),
+                    sum(game_state.get_agent_state(i).num_carrying for i in self.team))
+        if progress != getattr(self, 'decoy_progress', None):
+            self.decoy_progress, self.decoy_stall = progress, 0
+        self.decoy_stall = getattr(self, 'decoy_stall', 0) + 1
+        if self.decoy_stall % (self.DECOY_STALL + self.DECOY_PUSH) > self.DECOY_STALL:
+            self.decoy_now = False
+            self.decoy_pushes = getattr(self, 'decoy_pushes', 0) + 1
+            return self.attack(game_state, max(1, 1 - self.get_score(game_state)))
         if not active:  # nothing to distract: just score
             return self.attack(game_state, max(1, 1 - self.get_score(game_state)))
         target = min(active, key=lambda g: self.dist(my_pos, g))
@@ -2406,7 +2443,21 @@ class PlannerAttacker(PlannerAgentBase):
         else:
             action = None
         if self.legal(game_state, action) and action != Directions.STOP:
+            self.no_plan = 0
             return action
+
+        # FIX 2: no safe plan for NOPLAN_RISK turns in a row (a defender blocks every
+        # way in, outside the 4-cell loop detector): take the risk mode to get in.
+        self.no_plan = getattr(self, 'no_plan', 0) + 1
+        if self.no_plan >= self.NOPLAN_RISK and me.num_carrying == 0 and self.risk_turns == 0:
+            self.no_plan = 0
+            self.risk_turns = self.RISK_TURNS
+            self.noplan_risks = getattr(self, 'noplan_risks', 0) + 1
+            target, powered = self.planner.solve(game_state, quota)
+            if target is not None and target != 'home':
+                action, _ = self.bfs(my_pos, [target], self.danger_zone(active, my_pos))
+                if self.legal(game_state, action) and action != Directions.STOP:
+                    return action
 
         # No plan. Carrying food: bring it home. Empty: move along our border to the
         # crossing point farthest from the enemy ghosts and try again from there.
@@ -2588,9 +2639,28 @@ class RoleGuard(FlexAgent):
         cands = [c for c in cands if c[0] <= self.SNIPE_MAX]
         return min(cands)[1] if cands else None
 
+    # FIX 3: behind, and the enemy camps at home (no invader for QUIET_JOIN
+    # turns in a row): guarding an empty side is useless, join the attack.
+    QUIET_JOIN = 20
+
+    def join_attack(self, game_state):
+        enemies = self.enemy_states(game_state)
+        me = game_state.get_agent_state(self.index)
+        if any(e.is_pacman for _, e in enemies):
+            self.quiet = 0
+            return None
+        self.quiet = getattr(self, 'quiet', 0) + 1
+        if self.quiet >= self.QUIET_JOIN and self.get_score(game_state) < 0 and me.scared_timer == 0:
+            self.joins = getattr(self, 'joins', 0) + 1
+            return self.attack(game_state, self.QUOTA)
+        return None
+
     def choose_action(self, game_state):
         if not self.roles_on(game_state):
             return FlexAgent.choose_action(self, game_state)
+        action = self.join_attack(game_state)
+        if action is not None:
+            return action
         me = game_state.get_agent_state(self.index)
         my_pos = self.cell(me.get_position())
         enemies = self.enemy_states(game_state)
@@ -2613,6 +2683,12 @@ class RoleGuard(FlexAgent):
             return self.flee(game_state, active)
         if me.scared_timer > self.SCARED_ATTACK and not invaders:
             return self.attack(game_state, 1)
+        # FIX 5: our capsule is eaten (we are scared) and both enemies are on our
+        # side looting: a scared guard cannot stop them, and their side is empty.
+        # Loot it too instead of watching.
+        if me.scared_timer > self.SCARED_ATTACK and len(invaders) == len(enemies):
+            self.counter_loots = getattr(self, 'counter_loots', 0) + 1
+            return self.attack(game_state, self.QUOTA)
         if not invaders and self.get_score(game_state) <= self.SNIPE_LEAD:
             target = self.snipe_target(game_state, my_pos)
             if target is not None:
@@ -2700,6 +2776,7 @@ class CapsuleKeeper(RoleGuard):
         return None if self.race else RoleGuard.blitz(self, game_state)
 
     KEEP_RADIUS = 2
+    KEEP_CHASE_CARRY = 2
 
     def reach_cells(self, cap, r):
         return [c for c in self.home_dist if self.dist(c, cap) <= r]
@@ -2711,6 +2788,9 @@ class CapsuleKeeper(RoleGuard):
     def choose_action(self, game_state):
         if not self.race:
             return RoleGuard.choose_action(self, game_state)
+        action = self.join_attack(game_state)
+        if action is not None:
+            return action
         caps = self.get_capsules_you_are_defending(game_state)
         me = game_state.get_agent_state(self.index)
         if not caps or me.is_pacman or me.scared_timer > 0:
@@ -2725,6 +2805,12 @@ class CapsuleKeeper(RoleGuard):
             c = (int(my_pos[0] + dx), int(my_pos[1] + dy))
             if c in invaders and self.on_my_side(c):
                 return a
+        # FIX 1: a lone invader that is already eating (carrying food) while the
+        # other enemy stays home is not a capsule runner: defend normally.
+        loaded = [e for _, e in enemies if e.is_pacman and e.num_carrying >= self.KEEP_CHASE_CARRY]
+        if len(invaders) == 1 and loaded:
+            self.keep_fix1 = getattr(self, 'keep_fix1', 0) + 1
+            return self.defend(game_state)
         ring = [c for c in self.reach_cells(cap, self.KEEP_RADIUS) if c != cap and self.on_my_side(c)]
         if invaders and ring:
             inv = min(invaders, key=lambda p: self.dist(p, cap))
