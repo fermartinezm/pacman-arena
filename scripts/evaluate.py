@@ -294,7 +294,7 @@ def main():
         result = 'win' if score > 0 else 'tie' if score == 0 else 'loss'
         print(f'{("red", "blue")[side]:<5} {res["layout"]:<22} {res["seed"]:>5} {score:>6} {result:<7} '
               f'{max(moves, default=0) * 1000:>7.1f}ms  {" ".join(notes)}')
-        if res['crashed'] and res['stderr']:
+        if res['stderr']:
             print('      ' + res['stderr'].replace('\n', '\n      '))
 
     played = wins + ties + losses
