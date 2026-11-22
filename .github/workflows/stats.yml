@@ -1,0 +1,37 @@
+name: stats
+on:
+  workflow_dispatch:
+    inputs:
+      team:
+        default: 'variants/intent5.py'
+      layouts:
+        default: 'defaultCapture RANDOM officeCapture jumboCapture'
+      seeds:
+        default: '1-16'
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      layouts: ${{ steps.m.outputs.layouts }}
+    steps:
+      - id: m
+        run: echo "layouts=$(echo '${{ inputs.layouts }}' | jq -Rc 'split(" ")')" >> $GITHUB_OUTPUT
+  play:
+    needs: setup
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        layout: ${{ fromJson(needs.setup.outputs.layouts) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install frozendict
+      - name: stats
+        shell: pwsh
+        run: |
+          $env:JOBS = "4"
+          python tools/loss_stats.py ${{ inputs.team }} agents/External/heuristic_cp312/heuristic_team.py ${{ matrix.layout }} ${{ inputs.seeds }} 2>&1
